@@ -1,0 +1,88 @@
+services:
+  app:
+    build:
+      context: .
+    environment:
+      POSTGRES_DSN: postgresql://stampede:stampede@postgres:5432/stampede_lab
+      REDIS_URL: redis://redis:6379/0
+      CACHE_TTL_SECONDS: 5
+      HOT_KEY_ITEM_ID: 1
+      HOT_KEY_TTL_SECONDS: 2
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=2).read()",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: stampede_lab
+      POSTGRES_USER: stampede
+      POSTGRES_PASSWORD: stampede
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stampede -d stampede_lab"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  k6:
+    image: grafana/k6:0.49.0
+    profiles: ["tools"]
+    depends_on:
+      app:
+        condition: service_healthy
+    working_dir: /scripts
+    volumes:
+      - ./k6:/scripts:ro
+    environment:
+      BASE_URL: http://app:8000
+      HOT_ITEM_ID: 1
+      SPREAD_ITEM_COUNT: 1000
+      RATE: 200
+      DURATION: 30s
+      SIMULATE_DB_MS: 150
+      PROFILE: hot
+      WARMUP: true
+      EXPIRE_MODE: natural
+      EXPIRE_AT: 10s
+    command: ["run", "/scripts/read-heavy.js"]
+    healthcheck:
+      test: ["CMD", "k6", "version"]
+      interval: 30s
+      timeout: 5s
+      retries: 1
+
+volumes:
+  postgres_data:
