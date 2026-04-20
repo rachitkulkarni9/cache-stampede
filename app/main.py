@@ -8,6 +8,7 @@ import redis
 from fastapi import FastAPI, HTTPException, Query, Response, status
 from psycopg.rows import dict_row
 
+from app.coalescing import InFlightRequest, RequestCoalescer
 from app.config import settings
 from app.db import build_pool
 from app.metrics import MetricsStore
@@ -47,6 +48,7 @@ def startup() -> None:
     app.state.db_pool.wait()
     app.state.redis = redis.Redis.from_url(settings.redis_url, decode_responses=True)
     app.state.metrics = MetricsStore()
+    app.state.coalescer = RequestCoalescer()
 
 
 @app.on_event("shutdown")
@@ -129,6 +131,55 @@ def current_ttl_seconds(item_id: int) -> int | None:
 def request_metrics(latency_ms: float) -> dict:
     app.state.metrics.record_latency(latency_ms)
     return app.state.metrics.snapshot()
+
+
+def raise_coalesced_error(error: Exception) -> None:
+    if isinstance(error, HTTPException):
+        raise HTTPException(status_code=error.status_code, detail=error.detail)
+    raise RuntimeError("Coalesced rebuild failed") from error
+
+
+def get_from_coalesced_rebuild(
+    item_id: int,
+    entry: InFlightRequest,
+    response: Response,
+    started: float,
+    ttl_seconds: int,
+) -> dict:
+    wait_started = time.perf_counter()
+    entry.event.wait()
+    wait_ms = round((time.perf_counter() - wait_started) * 1000, 2)
+
+    if entry.error:
+        raise_coalesced_error(entry.error)
+
+    response.headers["X-Cache"] = "HIT"
+    app.state.metrics.increment("cache_hit_count")
+    total_ms = round((time.perf_counter() - started) * 1000, 2)
+    metrics = request_metrics(total_ms)
+    logger.info(
+        "request_coalescing item_id=%s role=waiter wait_ms=%s waiter_count=%s",
+        item_id,
+        wait_ms,
+        entry.waiter_count,
+    )
+    logger.info(
+        "cache_hit item_id=%s request_latency_ms=%s cache_hit_count=%s ttl_remaining_seconds=%s coalesced=True",
+        item_id,
+        total_ms,
+        metrics["cache_hit_count"],
+        current_ttl_seconds(item_id),
+    )
+
+    return {
+        "source": "redis",
+        "cache_hit": True,
+        "cache_ttl_seconds": ttl_seconds,
+        "cache_ttl_remaining_seconds": current_ttl_seconds(item_id),
+        "request_latency_ms": total_ms,
+        "item": entry.item,
+        "metrics": metrics,
+    }
 
 
 @app.post("/admin/cache/warm/{item_id}")
@@ -246,6 +297,7 @@ def get_item(
 ) -> dict:
     started = time.perf_counter()
     ttl_seconds = effective_ttl(item_id)
+    entry = None
 
     if not bypass_cache:
         cached = app.state.redis.get(cache_key(item_id))
@@ -271,6 +323,11 @@ def get_item(
                 "metrics": metrics,
             }
 
+        entry, is_leader = app.state.coalescer.acquire(item_id)
+        if not is_leader:
+            return get_from_coalesced_rebuild(item_id, entry, response, started, ttl_seconds)
+        logger.info("request_coalescing item_id=%s role=leader", item_id)
+
     app.state.metrics.increment("cache_miss_count")
     logger.info(
         "cache_miss item_id=%s cache_miss_count=%s bypass_cache=%s ttl_remaining_seconds=%s",
@@ -279,8 +336,16 @@ def get_item(
         bypass_cache,
         current_ttl_seconds(item_id),
     )
-    item, db_ms = fetch_item_from_db(item_id, simulate_db_ms)
-    rebuild_cache(item_id, item, ttl_seconds)
+    try:
+        item, db_ms = fetch_item_from_db(item_id, simulate_db_ms)
+        rebuild_cache(item_id, item, ttl_seconds)
+        if entry is not None:
+            app.state.coalescer.complete(item_id, entry, item, db_ms)
+    except Exception as error:
+        if entry is not None:
+            app.state.coalescer.fail(item_id, entry, error)
+        raise
+
     response.headers["X-Cache"] = "MISS"
     total_ms = round((time.perf_counter() - started) * 1000, 2)
     metrics = request_metrics(total_ms)

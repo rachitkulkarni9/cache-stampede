@@ -2,34 +2,35 @@
 
 ## Goal
 
-Prove the baseline cache-aside implementation stampedes when the hot key expires under load.
+Prove the first fix works: request coalescing should collapse one expiry burst into one DB fetch and one cache rebuild.
 
 ## Exact issue to look for
 
-After the hot key expires, many requests for the same `item_id` miss Redis at nearly the same time.
+After the hot key expires, many requests for the same `item_id` should still arrive together, but only one of them should rebuild the cache.
 
-That causes:
+That means you should see:
 
-- repeated `cache_miss` lines for the same `item_id`
-- repeated `db_fetch` lines for the same `item_id`
-- repeated `cache_rebuild` lines for the same `item_id`
+- one `request_coalescing item_id=1 role=leader`
+- one `cache_miss item_id=1`
+- many `request_coalescing item_id=1 role=waiter`
+- one `db_fetch item_id=1`
+- one `cache_rebuild item_id=1`
 
-All of those lines should appear in a tight burst right after the expiry marker.
-
-That burst is the issue: multiple concurrent requests all fall through to Postgres and rebuild the same cache entry independently.
+That is the fix: multiple concurrent requests no longer all fall through to Postgres.
 
 ## Best terminal output to screenshot
 
-### Screenshot 1: expiry marker followed by the burst
+### Screenshot 1: expiry marker followed by coalescing
 
 Watch the app logs and capture the moment where you see:
 
 - `experiment_marker action=expire_hot_key`
-- then many `cache_miss item_id=1`
-- then many `db_fetch item_id=1`
-- then many `cache_rebuild item_id=1`
+- then one `request_coalescing item_id=1 role=leader`
+- then many `request_coalescing item_id=1 role=waiter`
+- then one `db_fetch item_id=1`
+- then one `cache_rebuild item_id=1`
 
-This is the clearest proof of the stampede.
+This is the clearest proof that the coalescing fix is working.
 
 ### Screenshot 2: hot key is healthy before expiry
 
@@ -48,8 +49,8 @@ Call `GET /metrics` and capture the counters, especially:
 - `db_query_count`
 - `rebuild_count`
 
-The key point is that `db_query_count` and `rebuild_count` jump during the miss burst for one expired key.
+The key point is that `db_query_count` and `rebuild_count` should now rise much more slowly than before. For each expiry burst, they should increase by about one instead of spiking across many concurrent requests.
 
 ## One-line article takeaway
 
-When the hot cache entry expires, the app does not coordinate concurrent readers, so many requests hit Postgres and rebuild the same value at once.
+When the hot cache entry expires, one request rebuilds it while the other concurrent requests wait for that in-flight work instead of hammering Postgres together.

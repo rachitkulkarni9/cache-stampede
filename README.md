@@ -261,15 +261,17 @@ Use PowerShell to watch them during a run:
 docker compose logs -f app
 ```
 
-For article screenshots, the most important sequence is:
+For article screenshots after request coalescing, the most important sequence is:
 
 - `cache_hit item_id=1` before expiry
 - `experiment_marker action=expire_hot_key item_id=1`
-- a burst of repeated `cache_miss item_id=1`
-- a burst of repeated `db_fetch item_id=1`
-- a burst of repeated `cache_rebuild item_id=1`
+- one `request_coalescing item_id=1 role=leader`
+- one `cache_miss item_id=1`
+- many `request_coalescing item_id=1 role=waiter`
+- one `db_fetch item_id=1`
+- one `cache_rebuild item_id=1`
 
-That repeated burst for the same key is the broken behavior.
+That shows only one request rebuilt the value while the others waited and reused the result.
 
 ## Tuning For Stampede Experiments
 
@@ -278,13 +280,12 @@ The default cache TTL is 5 seconds for normal keys. The configured hot key is it
 - `HOT_KEY_TTL_SECONDS=2` or `1`
 - `SIMULATE_DB_MS=150` or higher in the k6 run
 
-With many requests targeting the same `HOT_ITEM_ID`, you should see bursts of Postgres reads and cache rebuilds after expiry because there is no request coalescing or cache locking yet.
+With many requests targeting the same `HOT_ITEM_ID`, you should now see one Postgres read and one cache rebuild per expiry burst, plus `request_coalescing` waiter logs for the concurrent requests that reused that rebuild.
 
 ## Extend Later
 
 This layout is meant to support follow-up experiments such as:
 
-- request coalescing
 - Redis locks
 - stale-while-revalidate
 - cache warming
