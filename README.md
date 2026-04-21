@@ -290,7 +290,3 @@ This layout is meant to support follow-up experiments such as:
 - stale-while-revalidate
 - cache warming
 - query and cache metrics
-
-## Screenshot Guide
-
-See [EXPERIMENT_NOTES.md](/c:/cache-stampede/EXPERIMENT_NOTES.md:1) for the exact terminal output to capture and the issue to call out in your article.
